@@ -15,4 +15,7 @@ To use:
       * Or no file is written to your /Documents directory upon completion 
 
 
-This is a test build used for dev purposes.
+This is a test build used for dev purposes. Please post issues or suggestions
+Public build 3/5/23
+Version 0.0.0.1
+
