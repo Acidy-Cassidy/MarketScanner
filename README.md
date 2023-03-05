@@ -19,3 +19,6 @@ This is a test build used for dev purposes. Please post issues or suggestions
 Public build 3/5/23
 Version 0.0.0.1
 
+
+
+If you have issues message my discord evilA#3875
