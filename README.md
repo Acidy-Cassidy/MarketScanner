@@ -1,5 +1,6 @@
 # MarketScanner
 
+NOTICE UNTIL CCP FIXES API THIS WONT WORK
 
 To use:
 * Run - Will take a LONG time. It is best to run durning sleep.
