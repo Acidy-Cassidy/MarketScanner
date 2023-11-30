@@ -1,0 +1,354 @@
+import os
+import requests
+import numpy as np
+import pandas as pd
+import time
+from datetime import datetime
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense
+from sklearn.preprocessing import MinMaxScaler 
+import tensorflow as tf
+
+API_KEY = "HOJyZGfniMt33ugFLT7BAWhhBqLYWGLdooXo6VTY"
+fib_cols = ['level_0', 'level_236', 'level_382', 'level_50', 'level_618', 'level_786', 'level_100']
+
+headers = {'Authorization': 'Bearer ' + API_KEY}
+
+# Initialize column names to lowercase
+high_col = 'high'
+low_col = 'low'
+close_col = 'close'
+volume_col = 'volume'
+
+# Update the numerical_cols to reflect the dynamically determined column names
+numerical_cols = [high_col, low_col, close_col, volume_col]
+
+def read_api_list(filename="/opt/FF1/ares.txt"):
+    with open(filename, 'r') as f:
+        return [line.strip() for line in f]
+
+def predict_and_retrain(model, x_scaled, y_scaled, y_actual, scaler_y, latest_eth_data):
+    # Check for NaN inputs and print a warning
+    if np.isnan(x_scaled).any():
+        print("Warning: NaN values detected in input data for prediction.")
+        
+    y_actual_scaled = scaler_y.transform(y_actual)
+    max_retries = 100
+    counter = 0
+    while counter < max_retries:
+        prediction = model.predict(x_scaled)
+        real_price = scaler_y.inverse_transform(y_scaled)
+        predicted_price = scaler_y.inverse_transform(prediction)
+        error = abs(real_price[0][0] - predicted_price[0][0])  # This is the absolute difference
+        if error > 0.10:  # If the absolute difference is more than 10 cents
+            print(f"Error is greater than $0.10. Retraining the model, attempt {counter + 1}...")
+            model.fit(x_scaled, y_actual_scaled, epochs=1, verbose=0)
+            counter += 1
+        else:
+            break
+    return model
+
+def fetch_api_data(api_list):
+    api_data = {}
+    for url in api_list:
+        try:
+            response = requests.get(url, headers=headers)
+            if response.status_code == 200:
+                data = response.json()
+                # Check for nested structure and extract data if needed
+                if 'result' in data and 'data' in data['result']:
+                    df_data = data['result']['data']
+                    df = pd.DataFrame(df_data)
+                else:
+                    df = pd.DataFrame(data)
+                
+                if 'timestamp' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                    df.set_index('timestamp', inplace=True)
+                
+                # Add a 'Timestamp' column
+                df['Timestamp'] = df.index
+
+                api_data[url] = df
+                print(f"\nData from {url}:")
+                print(df.head())  # Print the top few rows of the DataFrame
+            else:
+                print(f"Failed to fetch data from {url}. Status code: {response.status_code}")
+        except Exception as e:
+            print(f"Error fetching data from {url}: {e}")
+    return api_data
+
+def get_initial_data(n_past: int, max_retries: int = 5) -> pd.DataFrame:
+    # Fetch OHLCV data from the new API
+    url_ohlcv = api_list[0] + str(n_past)
+    
+    for _ in range(max_retries):
+        try:
+            response = requests.get(url_ohlcv, headers=headers)
+            response.raise_for_status()
+            data = response.json()["result"]["data"]
+            initial_data = pd.DataFrame(data)
+            
+            # Fetch additional data from the other APIs (excluding the first one) and augment the dataframe
+            for api in api_list[1:]:
+                response_additional = requests.get(api, headers=headers)
+                additional_data = response_additional.json()["result"]["data"]
+                df_additional = pd.DataFrame(additional_data)
+                initial_data = pd.concat([initial_data, df_additional], axis=1)
+                
+            # Ensure fetched data has at least n_past rows
+            if len(initial_data) < n_past:
+                raise ValueError(f"Expected initial_data to have at least {n_past} rows, but it has {len(initial_data)} rows.")
+            
+            return initial_data, datetime.now()
+        except requests.exceptions.RequestException as e:
+            print(f"Error occurred: {e}. Retrying...")
+            time.sleep(5)
+    raise Exception("Max retries exceeded. Please check your internet connection or the status of the API.")
+
+def get_latest_eth_data(previous_data: pd.DataFrame, last_successful_call: datetime, max_retries: int = 5):
+    # Fetch OHLCV data for the last 60 minutes from the new API
+    url_ohlcv = api_list[0] + "60"  # Using the first API for OHLCV data
+
+    for _ in range(max_retries):
+        try:
+            response = requests.get(url_ohlcv, headers=headers)
+            response.raise_for_status()
+            data = response.json()["result"]["data"]
+            latest_ohlcv_data = pd.DataFrame(data)
+
+            # Ensure the 'Timestamp' column exists in the latest_ohlcv_data
+            if 'Timestamp' not in latest_ohlcv_data.columns:
+                latest_ohlcv_data['Timestamp'] = pd.to_datetime(latest_ohlcv_data['datetime'])
+
+            # Sort the data by Timestamp in descending order (most recent first)
+            latest_ohlcv_data.sort_values(by='Timestamp', ascending=True, inplace=True)
+            
+            # Fetch additional data from the other APIs (excluding the first one) and augment the dataframe
+            for idx, api in enumerate(api_list[1:]):
+                response_additional = requests.get(api, headers=headers)
+                additional_data = response_additional.json()["result"]["data"]
+                df_additional = pd.DataFrame(additional_data)
+                # Drop duplicate columns (like 'datetime') from df_additional
+                common_cols = df_additional.columns.intersection(latest_ohlcv_data.columns).tolist()
+                df_additional = df_additional.drop(columns=common_cols)
+                latest_ohlcv_data = pd.concat([latest_ohlcv_data, df_additional], axis=1)  # Augment data
+
+            return latest_ohlcv_data, datetime.now()
+        except requests.exceptions.RequestException as e:
+            print(f"Error occurred: {e}. Retrying...")
+            time.sleep(5)
+
+    # Fallback in case of failure to fetch data
+    time_diff = datetime.now() - last_successful_call
+    missed_minutes = int(time_diff.total_seconds() / 60)
+    print(f"Missed {missed_minutes} minutes of data. Fetching historical data...")
+    missed_data, _ = get_initial_data(missed_minutes)
+    return missed_data, datetime.now()
+
+WINDOW_SIZE = 50
+
+def aggregate_data(api_data):
+    # Assuming the first API data is the primary data source
+    main_df = api_data[next(iter(api_data))]
+    
+    for key, df in api_data.items():
+        if key != next(iter(api_data)):  # To skip the first (primary) API data
+            # Merge the data on the common index (timestamp)
+            main_df = main_df.merge(df, left_index=True, right_index=True, how='left', suffixes=('', '_drop'))
+            main_df = main_df.drop(main_df.filter(regex='_drop$').columns, axis=1)
+            print(f"\nData after merging with {key}:")
+            print(main_df.head())  # Print the top few rows of the DataFrame after each merge
+    
+    return main_df
+
+def preprocess_real_time_data(latest_eth_data, previous_data, n_past, scaler_x, scaler_y):
+    print(f"Shape of previous_data: {previous_data.shape}")  
+    print(f"Shape of latest_eth_data: {latest_eth_data.shape}")  
+
+    # Validate uniqueness of the index for debugging
+    print(f"Unique indices for previous_data: {previous_data.index.nunique()}")
+    print(f"Total rows in previous_data: {len(previous_data)}")
+    print(f"Unique indices for latest_eth_data: {latest_eth_data.index.nunique()}")
+    print(f"Total rows in latest_eth_data: {len(latest_eth_data)}")
+
+    # Drop duplicate rows in both dataframes
+    latest_eth_data = latest_eth_data.drop_duplicates()
+    previous_data = previous_data.drop_duplicates()
+
+    # Handle NaN values: Fill NaN values using interpolation (linear method)
+    latest_eth_data = latest_eth_data.interpolate(method='linear')
+    previous_data = previous_data.interpolate(method='linear')
+    
+    # If there are still NaN values left, fill them with the last valid observation
+    latest_eth_data.fillna(method='ffill', inplace=True)
+    previous_data.fillna(method='ffill', inplace=True)
+
+    # If there are still NaN values left (this handles the case where the first few rows are NaN), 
+    # fill them with the next valid observation
+    latest_eth_data.fillna(method='bfill', inplace=True)
+    previous_data.fillna(method='bfill', inplace=True)
+
+    # Ensure that both dataframes have the same columns
+    for col in latest_eth_data.columns:
+        if col not in previous_data.columns:
+            previous_data[col] = np.nan
+    for col in previous_data.columns:
+        if col not in latest_eth_data.columns:
+            latest_eth_data[col] = np.nan
+
+    # Reset the index and then concatenate
+    input_data = pd.concat([previous_data.reset_index(drop=True), latest_eth_data.reset_index(drop=True)], axis=0, ignore_index=True)
+    print("Shape after concatenation:", input_data.shape)  
+
+    # Keep only the last `n_past` rows
+    input_data = input_data.tail(n_past)
+
+    if len(input_data) != n_past:
+        raise ValueError(f"Expected input_data to have {n_past} rows, but it has {len(input_data)} rows.")
+
+    # Ensure the data has the correct columns for scaling
+    for col in numerical_cols:
+        if col not in input_data.columns:
+            input_data[col] = 0
+
+    x_scaled = scaler_x.transform(input_data[numerical_cols])
+    x_scaled = x_scaled.reshape((1, n_past, len(numerical_cols)))
+
+    # Check for NaN values in x_scaled
+    if np.isnan(x_scaled).any():
+        print("Warning: NaN values detected in x_scaled!")
+        
+    print("Initial data shape: ", input_data.shape)
+    print("Numerical columns: ", numerical_cols)
+    return x_scaled
+
+def predict_eth_price(input_data, model):
+    prediction = model.predict(np.array(input_data))
+    return prediction
+
+def custom_loss(y_true, y_pred):
+    error = y_true - y_pred
+    absolute_error = tf.abs(error)
+    squared_error = tf.square(error)
+    return tf.where(absolute_error < 0.05, squared_error, squared_error + 0.1 * tf.square(absolute_error - 0.05))
+
+def create_model(n_past):
+    n_features = len(numerical_cols)
+    model = Sequential()
+    model.add(LSTM(units=128, activation='relu', return_sequences=True, input_shape=(n_past, n_features)))
+    model.add(LSTM(units=64, activation='relu', return_sequences=False))
+    model.add(Dense(units=1, activation='linear'))
+    model.compile(optimizer='adam', loss=custom_loss)
+    return model
+
+if __name__ == "__main__":
+    print('Starting Scripts...')
+    n_past = 60
+
+    # Fetching aggregated data
+    print("Fetching initial data...")
+    api_list = read_api_list()
+    aggregated_data = fetch_api_data(api_list)
+    initial_data = aggregate_data(aggregated_data)
+
+    # Check for NaN values in initial_data for debugging
+    if initial_data.isnull().any().any():
+        print("Warning: NaN values detected in initial_data!")
+        print(initial_data[initial_data.isnull().any(axis=1)])
+
+    # Debugging statement
+    print(f"Shape of initial_data: {initial_data.shape}")
+
+    # Fitting MinMaxScaler on initial data
+    print("Fitting MinMaxScaler on initial data...")
+    scaler_x = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    scaler_x.fit(initial_data[numerical_cols])
+    scaler_y.fit(initial_data[[close_col]])
+
+    # Creating the LSTM model
+    print("Creating model...")
+    model = create_model(n_past)
+    weights_file = 'best_weights_pred1hr.hdf5'
+    if os.path.isfile(weights_file):
+        print("Loading weights into model...")
+        model.load_weights(weights_file)
+    else:
+        print(f"No weights file found at {weights_file}, starting with random weights.")
+        model.save_weights(weights_file)
+
+    # File initialization
+    if not os.path.exists('1hrACT.csv'):
+        with open('1hrACT.csv', 'w') as f:
+            f.write('Timestamp,Predicted_Price\n')
+    if not os.path.exists('predictions1hr.csv'):
+        with open('predictions1hr.csv', 'w') as f:
+            f.write('Timestamp,Real_Price,Predicted_Price,Actual_Price_After_1hr,Actual_Timestamp_After_1hr\n')
+
+    previous_data = initial_data
+    last_successful_call = datetime.now()
+    start_time = time.time()
+    while True:
+        #start_time = time.time()  # Start the timer
+
+        print("\nFetching latest Ethereum price and data...")
+        latest_eth_data, last_successful_call = get_latest_eth_data(previous_data, last_successful_call)
+
+        if latest_eth_data.empty:
+            print("No new data fetched. Skipping this iteration.")
+            continue
+
+        print("latest_eth_data:\n", latest_eth_data)
+
+        # Fetch new aggregated data
+        aggregated_data = fetch_api_data(api_list)
+        new_data = aggregate_data(aggregated_data)
+
+        # Combine the previous data and new data
+        combined_data = pd.concat([previous_data, new_data], ignore_index=True)
+
+        # Ensure we have only n_past rows for the next iteration
+        previous_data = combined_data.iloc[-n_past:]
+
+        print("Preprocessing real-time data...")
+        x_scaled = preprocess_real_time_data(latest_eth_data, previous_data, n_past, scaler_x, scaler_y)
+
+        print("Predicting Ethereum price...")
+        prediction = predict_eth_price(x_scaled, model)
+        predicted_price = scaler_y.inverse_transform(prediction)
+
+        real_close_price = latest_eth_data[close_col].iloc[-1]
+
+        if pd.isna(real_close_price):
+            print("Encountered NaN value in real_close_price. Skipping this iteration.")
+            continue
+
+        print(f"Real Ethereum Close Price: {real_close_price}")
+        print(f"Predicted Ethereum Price: {predicted_price}")
+
+        print("Waiting for 60 minutes before retraining...")
+        time.sleep(3600)  # Wait for 60 minutes
+
+        # Fetch the latest Ethereum data again after 60 minutes
+        latest_eth_data, _ = get_latest_eth_data(previous_data, last_successful_call)
+        actual_price_after_1hr = latest_eth_data[close_col].iloc[-1]  # Define actual_price_after_5min here
+
+        y_scaled = scaler_y.transform([[actual_price_after_1hr]])
+        actual_timestamp_after_1hr = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        print("Training the model on the new data...")
+        model = predict_and_retrain(model, x_scaled, y_scaled, [[actual_price_after_1hr]], scaler_y, latest_eth_data)
+        model.save_weights('best_weights_pred1hr.hdf5')
+
+        timestamp_value = latest_eth_data.get('Timestamp')
+        if timestamp_value is not None:
+            with open('1hrACT.csv', 'a') as f:
+                f.write(f"{timestamp_value.iloc[0]},{predicted_price[0][0]}\n")
+            with open('predictions1hr.csv', 'a') as f:
+                f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')},{real_close_price},{predicted_price[0][0]},{actual_price_after_1hr},{actual_timestamp_after_1hr}\n")
+
+        elapsed_time = time.time() - start_time
+        sleep_time = max(3600 - elapsed_time, 0)
+        print(f"Waiting for {sleep_time:.2f} seconds before the next iteration...")
+        time.sleep(sleep_time)
